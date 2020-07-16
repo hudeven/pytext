@@ -13,6 +13,7 @@ from pytext.config.component import (
     Component,
     ComponentType,
     create_optimizer,
+    create_privacy_engine,
     create_scheduler,
     create_sparsifier,
 )
@@ -21,7 +22,7 @@ from pytext.data.data_handler import BatchIterator
 from pytext.metric_reporters import MetricReporter
 from pytext.models.distributed_model import DistributedModel
 from pytext.models.model import Model
-from pytext.optimizer import Adam, Optimizer, learning_rates
+from pytext.optimizer import Adam, Optimizer, PrivacyEngine, learning_rates
 from pytext.optimizer.fp16_optimizer import FP16Optimizer, FP16OptimizerFairseq
 from pytext.optimizer.scheduler import Scheduler
 from pytext.optimizer.sparsifiers.sparsifier import Sparsifier
@@ -119,6 +120,8 @@ class Trainer(TrainerBase):
         #: backward and master weight will be maintained on original optimizer.
         #: https://arxiv.org/abs/1710.03740
         fp16_args: FP16Optimizer.Config = FP16OptimizerFairseq.Config()
+        # PrivacyEngine related args
+        privacy_engine: Optional[PrivacyEngine.Config] = None
 
     def __init__(self, config: Config, model: torch.nn.Module):
         if config.early_stop_after > 0:
@@ -135,6 +138,11 @@ class Trainer(TrainerBase):
             self.optimizer: torch.optim.Optimizer = create_optimizer(
                 config.optimizer, model
             )
+        self.privacy_engine: PrivacyEngine = (
+            create_privacy_engine(config.privacy_engine, model, self.optimizer)
+            if config.privacy_engine
+            else None
+        )
 
         self.scheduler: torch.optim.lr_scheduler = (
             create_scheduler(config.scheduler, self.optimizer)
@@ -266,6 +274,22 @@ class Trainer(TrainerBase):
 
         return True
 
+    def move_state_dict_to_cpu(self, state_dict):
+        for key, maybe_parameter in state_dict.items():
+            if isinstance(maybe_parameter, torch.Tensor):
+                state_dict[key] = maybe_parameter.cpu()
+            else:
+                self.move_state_dict_to_cpu(maybe_parameter)
+        return state_dict
+
+    def move_state_dict_to_gpu(self, state_dict):
+        for key, maybe_parameter in state_dict.items():
+            if isinstance(maybe_parameter, torch.Tensor):
+                state_dict[key] = maybe_parameter.cuda()
+            else:
+                self.move_state_dict_to_gpu(maybe_parameter)
+        return state_dict
+
     def update_best_model(
         self, state: TrainingState, train_config: PyTextConfig, eval_metric
     ):
@@ -282,8 +306,7 @@ class Trainer(TrainerBase):
         model_state = state.model.state_dict()
         # save to cpu to avoid multiple model copies in gpu memory
         if cuda.CUDA_ENABLED:
-            for key, parameter in model_state.items():
-                model_state[key] = parameter.cpu()
+            self.move_state_dict_to_cpu(model_state)
         state.best_model_state = model_state
 
     @timing.time("save checkpoint")
@@ -318,9 +341,7 @@ class Trainer(TrainerBase):
         if cuda.CUDA_ENABLED:
             # Move current model to CPU to avoid multiple models in GPU memory
             state.model.cpu()
-            state.model.load_state_dict(
-                {k: v.cuda() for k, v in state.best_model_state.items()}
-            )
+            state.model.load_state_dict(state.best_model_state)
             # Move model back to GPU
             state.model.cuda()
         else:
@@ -357,6 +378,7 @@ class Trainer(TrainerBase):
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             sparsifier=self.sparsifier,
+            privacy_engine=self.privacy_engine,
             rank=rank,
         )
         return self.train_from_state(
@@ -402,6 +424,10 @@ class Trainer(TrainerBase):
         )
         print(f"Model :{model}")
         print(f"Num trainable parameters: {trainable_params}")
+
+        self.sparsifier.initialize(
+            self, state, eval_data, metric_reporter, train_config
+        )
 
         while self.continue_training(state):
             state.epoch += 1
@@ -488,6 +514,7 @@ class Trainer(TrainerBase):
         report_metric = state.stage != Stage.TRAIN or self.config.report_train_metrics
         model = state.model
         samples = []
+        is_data_empty = True
 
         """
         Sometimes, a batch of inputs is too large to fit into GPU, which has to
@@ -500,6 +527,7 @@ class Trainer(TrainerBase):
         performance by reduce the total network transfer bytes.
         """
         for sample in enumerate(data):
+            is_data_empty = False
             samples.append(sample)
             if (
                 state.stage != Stage.TRAIN
@@ -513,6 +541,15 @@ class Trainer(TrainerBase):
 
         metrics = None
         if report_metric:
+            if is_data_empty:
+                error_msg = (
+                    f"Trying to report metric for stage {state.stage}, but no data was "
+                    "found. Either disable metric reporting for this stage, pass in "
+                    "non-empty data, or see if data fields are misnamed (warnings "
+                    "would appear in preceding stdout logs)."
+                )
+                raise ValueError(error_msg)
+
             with timing.time("report metrics"):
                 metrics = metric_reporter.report_metric(
                     model,
@@ -522,6 +559,7 @@ class Trainer(TrainerBase):
                     optimizer=getattr(
                         state, "optimizer", None
                     ),  # optimizer is not present during test
+                    privacy_engine=getattr(state, "privacy_engine", None),
                 )
         else:
             metric_reporter._reset()
@@ -575,11 +613,15 @@ class Trainer(TrainerBase):
 
             if batch_id % self.config.num_samples_to_log_progress == 0:
                 print(
-                    f"Running batch {batch_id} for epoch {state.epoch} in {state.stage} stage",
+                    f"Running batch {batch_id} for epoch {state.epoch} \
+                        in {state.stage} stage",
                     flush=True,
                 )
         # update gradients after len(samples) forward & backward
         self.optimizer_step(state)
+        with timing.time("add gradients"):
+            if report_metric and state.stage == Stage.TRAIN:
+                metric_reporter.add_gradients(state.model)
         self.sparsification_step(state)
 
 
@@ -634,6 +676,9 @@ class TaskTrainer(Trainer):
                     metric_reporter.report_realtime_metric(state.stage)
         # update gradients after #len(samples) forward & backward
         self.optimizer_step(state)
+        with timing.time("add gradients"):
+            if report_metric and state.stage == Stage.TRAIN:
+                metric_reporter.add_gradients(state.model)
         self.sparsification_step(state)
 
     def _prepare_scheduler(self, training_batches, scheduler=None):

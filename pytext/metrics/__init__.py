@@ -17,10 +17,12 @@ from typing import (
 )
 
 import numpy as np
+from pytext.common.constants import SpecialTokens
 from pytext.utils import cuda
 from pytext.utils.ascii_table import ascii_table
 
 
+NAN_LABELS = [SpecialTokens.UNK, SpecialTokens.PAD]
 RECALL_AT_PRECISION_THRESHOLDS = [0.2, 0.4, 0.6, 0.8, 0.9]
 PRECISION_AT_RECALL_THRESHOLDS = [0.2, 0.4, 0.6, 0.8, 0.9]
 
@@ -93,6 +95,25 @@ class SoftClassificationMetrics(NamedTuple):
     precision_at_recall: Dict[float, float]
     decision_thresh_at_recall: Dict[float, float]
     roc_auc: Optional[float]
+
+
+class MultiLabelSoftClassificationMetrics(NamedTuple):
+    """
+    Classification scores that are independent of thresholds.
+    """
+
+    average_label_precision: Dict[str, float]
+    average_overall_precision: float
+    average_label_recall: Dict[str, float]
+    average_overall_recall: float
+    recall_at_precision: Dict[str, Dict[str, Dict[float, float]]]
+    decision_thresh_at_precision: Dict[str, Dict[str, Dict[float, float]]]
+    precision_at_recall: Dict[str, Dict[str, Dict[float, float]]]
+    decision_thresh_at_recall: Dict[str, Dict[str, Dict[float, float]]]
+    roc_auc: Optional[Dict[Optional[str], Optional[Dict[str, Optional[float]]]]]
+    average_overall_auc: float
+    label_accuracy: Dict[str, float]
+    average_overall_accuracy: float
 
 
 class MacroPRF1Scores(NamedTuple):
@@ -656,6 +677,27 @@ def precision_at_recall(
     return precision_at_recall_dict, decision_thresh_at_recall_dict
 
 
+def compute_average_recall(
+    predictions: Sequence[LabelPrediction],
+    label_names: Sequence[str],
+    average_precisions: Dict[str, float],
+) -> float:
+    recalls = []
+    for i, label_name in enumerate(label_names):
+        y_true = []
+        y_score = []
+        for label_scores, _, expected in predictions:
+            y_true.append(expected == i)
+            y_score.append(label_scores[i])
+        y_true_sorted, y_score_sorted = sort_by_score(y_true, y_score)
+        recall_at_precision_dict, _ = recall_at_precision(
+            y_true_sorted, y_score_sorted, [average_precisions[label_name]]
+        )
+        for _, value in recall_at_precision_dict.items():
+            recalls.append(value)
+    return sum(v for v in recalls) / (len(recalls) * 1.0)
+
+
 def compute_soft_metrics(
     predictions: Sequence[LabelPrediction],
     label_names: Sequence[str],
@@ -751,6 +793,96 @@ def compute_multi_label_soft_metrics(
             roc_auc=roc_auc,
         )
     return soft_metrics
+
+
+def compute_multi_label_multi_class_soft_metrics(
+    predictions: Sequence[Sequence[LabelPrediction]],
+    label_names: Sequence[str],
+    label_vocabs: Sequence[Sequence[str]],
+    recall_at_precision_thresholds: Sequence[float] = RECALL_AT_PRECISION_THRESHOLDS,
+    precision_at_recall_thresholds: Sequence[float] = PRECISION_AT_RECALL_THRESHOLDS,
+) -> MultiLabelSoftClassificationMetrics:
+    """
+
+    Computes multi-label soft classification metrics with multi-class accommodation
+
+    Args:
+        predictions: multi-label predictions,
+                     including the confidence score for each label.
+        label_names: Indexed label names.
+        recall_at_precision_thresholds: precision thresholds at which to calculate
+            recall
+        precision_at_recall_thresholds: recall thresholds at which to calculate
+            precision
+
+
+    Returns:
+        Dict from label strings to their corresponding soft metrics.
+    """
+
+    average_precision = {}
+    average_recall = {}
+    recall_at_precision = {}
+    decision_thresh_at_precision = {}
+    precision_at_recall = {}
+    decision_thresh_at_recall = {}
+    roc_auc = {}
+    class_accuracy = {}
+    average_auc = []
+
+    for label_idx, label_vocab in enumerate(label_vocabs):
+        label = list(label_names)[label_idx]
+        avg = (
+            sum(1 for s, p, e in predictions[label_idx] if p == e)
+            / len(predictions[label_idx])
+            * 1.0
+        )
+        class_accuracy[label] = avg
+        soft_metrics_ = compute_soft_metrics(predictions[label_idx], label_vocab)
+        temp_avg_precision_ = {k: v.average_precision for k, v in soft_metrics_.items()}
+        average_precision[label] = sum(
+            v for k, v in temp_avg_precision_.items() if k not in NAN_LABELS
+        ) / (
+            sum(1 for k, v in temp_avg_precision_.items() if k not in NAN_LABELS) * 1.0
+        )
+
+        average_recall[label] = compute_average_recall(
+            predictions[label_idx], label_vocab, temp_avg_precision_
+        )
+        recall_at_precision[label] = {
+            k: v.recall_at_precision for k, v in soft_metrics_.items()
+        }
+        decision_thresh_at_precision[label] = {
+            k: v.decision_thresh_at_precision for k, v in soft_metrics_.items()
+        }
+        precision_at_recall[label] = {
+            k: v.precision_at_recall for k, v in soft_metrics_.items()
+        }
+        decision_thresh_at_recall[label] = {
+            k: v.decision_thresh_at_recall for k, v in soft_metrics_.items()
+        }
+        roc_auc[label] = {k: v.roc_auc for k, v in soft_metrics_.items()}
+        average_auc.append(
+            sum(v for v in roc_auc[label].values()) / (len(roc_auc[label]) * 1.0)
+        )
+
+    return MultiLabelSoftClassificationMetrics(
+        average_label_precision=average_precision,
+        average_overall_precision=sum(v for v in average_precision.values())
+        / (len(average_precision) * 1.0),
+        average_label_recall=average_recall,
+        average_overall_recall=sum(v for v in average_recall.values())
+        / (len(average_recall) * 1.0),
+        recall_at_precision=recall_at_precision,
+        decision_thresh_at_precision=decision_thresh_at_precision,
+        precision_at_recall=precision_at_recall,
+        decision_thresh_at_recall=decision_thresh_at_recall,
+        roc_auc=roc_auc,
+        average_overall_auc=sum(v for v in average_auc) / (len(average_auc) * 1.0),
+        label_accuracy=class_accuracy,
+        average_overall_accuracy=sum(v for v in class_accuracy.values())
+        / (len(class_accuracy) * 1.0),
+    )
 
 
 def compute_matthews_correlation_coefficients(

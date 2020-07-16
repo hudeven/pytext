@@ -4,14 +4,21 @@
 from typing import Dict, Optional, Tuple
 
 import torch
+from pytext import resources
 from pytext.common.constants import Stage
 from pytext.config import ConfigBase
 from pytext.data.roberta_tensorizer import (
     RoBERTaTensorizer,
     RoBERTaTokenLevelTensorizer,
 )
-from pytext.data.tensorizers import FloatListTensorizer, LabelTensorizer, Tensorizer
+from pytext.data.tensorizers import (
+    FloatListTensorizer,
+    LabelTensorizer,
+    NumericLabelTensorizer,
+    Tensorizer,
+)
 from pytext.models.bert_classification_models import NewBertModel
+from pytext.models.bert_regression_model import NewBertRegressionModel
 from pytext.models.decoders.mlp_decoder import MLPDecoder
 from pytext.models.model import BaseModel
 from pytext.models.module import Module, create_module
@@ -63,12 +70,15 @@ class RoBERTaEncoderJit(RoBERTaEncoderBase):
 
     class Config(RoBERTaEncoderBase.Config):
         pretrained_encoder: Module.Config = Module.Config(
-            load_path=(
-                "manifold://pytext_training/tree/static/models/roberta_public.pt1"
-            )
+            load_path=resources.roberta.PUBLIC
         )
 
     def __init__(self, config: Config, output_encoded_layers: bool, **kwarg) -> None:
+        config.pretrained_encoder.load_path = (
+            resources.roberta.RESOURCE_MAP[config.pretrained_encoder.load_path]
+            if config.pretrained_encoder.load_path in resources.roberta.RESOURCE_MAP
+            else config.pretrained_encoder.load_path
+        )
         super().__init__(config, output_encoded_layers=output_encoded_layers)
         assert config.pretrained_encoder.load_path, "Load path cannot be empty."
         self.encoder = create_module(config.pretrained_encoder)
@@ -99,6 +109,13 @@ class RoBERTaEncoder(RoBERTaEncoderBase):
 
     def __init__(self, config: Config, output_encoded_layers: bool, **kwarg) -> None:
         super().__init__(config, output_encoded_layers=output_encoded_layers)
+
+        # map to the real model_path
+        config.model_path = (
+            resources.roberta.RESOURCE_MAP[config.model_path]
+            if config.model_path in resources.roberta.RESOURCE_MAP
+            else config.model_path
+        )
         # assert config.pretrained_encoder.load_path, "Load path cannot be empty."
         self.encoder = SentenceEncoder(
             transformer=Transformer(
@@ -166,6 +183,28 @@ class RoBERTa(NewBertModel):
                 output_layer=self.output_layer.torchscript_predictions(),
                 tensorizer=script_tensorizer,
             )
+
+
+class RoBERTaRegression(NewBertRegressionModel):
+    class Config(NewBertRegressionModel.Config):
+        class RegressionModelInput(ConfigBase):
+            tokens: RoBERTaTensorizer.Config = RoBERTaTensorizer.Config()
+            labels: NumericLabelTensorizer.Config = NumericLabelTensorizer.Config()
+
+        inputs: RegressionModelInput = RegressionModelInput()
+        encoder: RoBERTaEncoderBase.Config = RoBERTaEncoderJit.Config()
+
+    def torchscriptify(self, tensorizers, traced_model):
+        """Using the traced model, create a ScriptModule which has a nicer API that
+        includes generating tensors from simple data types, and returns classified
+        values according to the output layer (eg. as a dict mapping class name to score)
+        """
+        script_tensorizer = tensorizers["tokens"].torchscriptify()
+        return ScriptPyTextModule(
+            model=traced_model,
+            output_layer=self.output_layer.torchscript_predictions(),
+            tensorizer=script_tensorizer,
+        )
 
 
 class RoBERTaWordTaggingModel(BaseModel):

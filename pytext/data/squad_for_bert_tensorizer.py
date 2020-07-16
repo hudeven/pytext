@@ -5,12 +5,14 @@ import itertools
 from typing import List
 
 import torch
+from pytext import resources
+from pytext.common.constants import SpecialTokens
 from pytext.config.component import ComponentType, create_component
 from pytext.data.bert_tensorizer import BERTTensorizer, build_fairseq_vocab
 from pytext.data.roberta_tensorizer import RoBERTaTensorizer
 from pytext.data.tensorizers import lookup_tokens
 from pytext.data.tokenizers import Tokenizer
-from pytext.data.utils import BOS, EOS, MASK, PAD, UNK, Vocabulary, pad_and_tensorize
+from pytext.data.utils import Vocabulary, pad_and_tensorize
 from pytext.torchscript.tensorizer import ScriptRoBERTaTensorizerWithIndices
 from pytext.torchscript.vocab import ScriptVocabulary
 from pytext.utils.file_io import PathManager
@@ -53,6 +55,7 @@ class SquadForBERTTensorizer(BERTTensorizer):
         self.answer_starts_column = answer_starts_column
 
     def _lookup_tokens(self, text: str, seq_len: int = None):
+        # BoS token is added explicitly in numberize()
         return lookup_tokens(
             text,
             tokenizer=self.tokenizer,
@@ -261,15 +264,21 @@ class SquadForRoBERTaTensorizer(SquadForBERTTensorizer, RoBERTaTensorizer):
     @classmethod
     def from_config(cls, config: Config):
         tokenizer = create_component(ComponentType.TOKENIZER, config.tokenizer)
+
+        config.vocab_file = (
+            resources.roberta.RESOURCE_MAP[config.vocab_file]
+            if config.vocab_file in resources.roberta.RESOURCE_MAP
+            else config.vocab_file
+        )
         with PathManager.open(config.vocab_file) as file_path:
             vocab = build_fairseq_vocab(
                 vocab_file=file_path,
                 special_token_replacements={
-                    "<pad>": PAD,
-                    "<s>": BOS,
-                    "</s>": EOS,
-                    "<unk>": UNK,
-                    "<mask>": MASK,
+                    "<pad>": SpecialTokens.PAD,
+                    "<s>": SpecialTokens.BOS,
+                    "</s>": SpecialTokens.EOS,
+                    "<unk>": SpecialTokens.UNK,
+                    "<mask>": SpecialTokens.MASK,
                 },
             )
         return cls(
@@ -302,11 +311,12 @@ class SquadForRoBERTaTensorizer(SquadForBERTTensorizer, RoBERTaTensorizer):
         self.wrap_special_tokens = False
 
     def _lookup_tokens(self, text: str, seq_len: int = None):
+        # BoS token is added explicitly in numberize()
         return lookup_tokens(
             text,
             tokenizer=self.tokenizer,
             vocab=self.vocab,
-            bos_token=self.vocab.bos_token,
+            bos_token=None,
             eos_token=self.vocab.eos_token,
             max_seq_len=seq_len if seq_len else self.max_seq_len,
         )

@@ -66,6 +66,16 @@ def build_subclass_dict(subclasses):
     return subclasses_dict
 
 
+def _any_from_json(json_obj):
+    if _is_dict(json_obj):
+        # convert to vanilla python dict
+        # call _any_from_json recursively on values
+        # Example: fancy_dict(a_key, fancy_dict(another_key, value))
+        # will get converted into plain dict {a_key: {another_key: value}}
+        return {key: _any_from_json(value) for key, value in json_obj.items()}
+    return json_obj
+
+
 def _union_from_json(subclasses, json_obj):
     if not _is_dict(json_obj):
         raise IncorrectTypeError(
@@ -94,19 +104,6 @@ def _union_from_json(subclasses, json_obj):
         ) from e
 
 
-def _any_from_json(cls, json_obj):
-    if _is_dict(json_obj):
-        if len(json_obj) == 1:
-            type_name, value = list(json_obj.keys())[0], list(json_obj.values())[0]
-            assert (
-                type_name == type(value).__name__
-            ), f"type of value mismatches: {type_name} vs. {type(value).__name__} from {value}"
-            return value
-        else:
-            raise TypeError("PyText Config currently don't support this")
-    return json_obj
-
-
 def _is_optional(cls):
     return _get_class_type(cls) == Union and type(None) in cls.__args__
 
@@ -132,7 +129,7 @@ def _value_from_json(cls, value):
     elif hasattr(cls, "_fields"):
         return config_from_json(cls, value)
     elif cls_type == Any:
-        return _any_from_json(cls, value)
+        return _any_from_json(value)
     elif cls_type == Union:
         return _union_from_json(cls.__args__, value)
     elif issubclass(cls_type, Enum):
@@ -236,11 +233,13 @@ def _value_to_json(cls, value):
     elif _is_optional(cls) and len(cls.__args__) == 2:
         sub_cls = cls.__args__[0] if type(None) != cls.__args__[0] else cls.__args__[1]
         return _value_to_json(sub_cls, value)
-    elif cls_type == Any or cls_type == Union or getattr(cls, "__EXPANSIBLE__", False):
+    elif cls_type == Union or getattr(cls, "__EXPANSIBLE__", False):
         real_cls = type(value)
         if hasattr(real_cls, "_fields"):
             value = config_to_json(real_cls, value)
         return {_canonical_typename(real_cls): value}
+    elif cls_type == Any:
+        return value
     # nested config
     elif hasattr(cls, "_fields"):
         return config_to_json(cls, value)

@@ -10,6 +10,13 @@ _run:
       sudo ./install_deps
       sudo pip install --progress-bar off pytest pytest-cov
 
+      # sacrebleu installs typing-3.7.4 which is incompatible with pip from python-3.7.7
+      if [ "${CIRCLE_JOB}" == "build_Py3.7" ]; then
+        sudo pip uninstall -y typing
+      fi
+      sudo pip uninstall -y onnx
+      # Instal onnx pip from source
+      MAX_JOBS=4 pip install git+https://github.com/onnx/onnx
 
 _do_tests: &do_tests
   - checkout
@@ -69,7 +76,7 @@ jobs:
       - run:
           name: setup lint
           command: |
-              sudo pip install black isort
+              sudo pip install black isort==4.3.21
       - run:
           name: run black
           command: black pytext --check --diff

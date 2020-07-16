@@ -3,9 +3,9 @@
 import itertools
 import re
 from collections import Counter
-from typing import List, NamedTuple
+from typing import Dict, List, NamedTuple
 
-from pytext.common.constants import DatasetFieldName, Stage
+from pytext.common.constants import DatasetFieldName, SpecialTokens, Stage
 from pytext.data import CommonMetadata
 from pytext.metrics import (
     AllConfusions,
@@ -13,6 +13,7 @@ from pytext.metrics import (
     LabelPrediction,
     PRF1Metrics,
     compute_classification_metrics,
+    compute_multi_label_multi_class_soft_metrics,
 )
 from pytext.metrics.intent_slot_metrics import (
     Node,
@@ -24,6 +25,9 @@ from pytext.utils.data import merge_token_labels_to_slot, parse_slot_string
 
 from .channel import Channel, ConsoleChannel, FileChannel
 from .metric_reporter import MetricReporter
+
+
+NAN_LABELS = [SpecialTokens.UNK, SpecialTokens.PAD]
 
 
 def get_slots(word_names):
@@ -90,6 +94,72 @@ class WordTaggingMetricReporter(MetricReporter):
 
     def get_model_select_metric(self, metrics):
         return metrics.micro_scores.f1
+
+
+class MultiLabelSequenceTaggingMetricReporter(MetricReporter):
+    def __init__(self, label_names, pad_idx, channels, label_vocabs=None):
+        self.label_names = label_names
+        self.pad_idx = pad_idx
+        self.label_vocabs = label_vocabs
+        super().__init__(channels)
+
+    @classmethod
+    def from_config(cls, config, tensorizers):
+        return MultiLabelSequenceTaggingMetricReporter(
+            channels=[ConsoleChannel(), FileChannel((Stage.TEST,), config.output_path)],
+            label_names=tensorizers.keys(),
+            pad_idx=[v.pad_idx for _, v in tensorizers.items()],
+            label_vocabs=[v.vocab._vocab for _, v in tensorizers.items()],
+        )
+
+    def aggregate_tuple_data(self, all_data, new_batch):
+        assert isinstance(new_batch, tuple)
+        # num_label_set * bsz * ...
+        data = [self._make_simple_list(d) for d in new_batch]
+        # convert to bsz * num_label_set * ...
+        for d in zip(*data):
+            all_data.append(d)
+
+    def aggregate_preds(self, batch_preds, batch_context=None):
+        self.aggregate_tuple_data(self.all_preds, batch_preds)
+
+    def aggregate_targets(self, batch_targets, batch_context=None):
+        self.aggregate_tuple_data(self.all_targets, batch_targets)
+
+    def aggregate_scores(self, batch_scores):
+        self.aggregate_tuple_data(self.all_scores, batch_scores)
+
+    def calculate_metric(self):
+        list_score_pred_expect = []
+        for label_idx, _ in enumerate(self.label_names):
+            list_score_pred_expect.append(
+                list(
+                    itertools.chain.from_iterable(
+                        (
+                            LabelPrediction(s, p, e)
+                            for s, p, e in zip(
+                                scores[label_idx], pred[label_idx], expect[label_idx]
+                            )
+                            if e != self.pad_idx[label_idx]
+                        )
+                        for scores, pred, expect in zip(
+                            self.all_scores, self.all_preds, self.all_targets
+                        )
+                    )
+                )
+            )
+
+        metrics = compute_multi_label_multi_class_soft_metrics(
+            list_score_pred_expect, self.label_names, self.label_vocabs
+        )
+        return metrics
+
+    def batch_context(self, raw_batch, batch):
+        return {}
+
+    @staticmethod
+    def get_model_select_metric(metrics):
+        return metrics.average_overall_precision
 
 
 class SequenceTaggingMetricReporter(MetricReporter):

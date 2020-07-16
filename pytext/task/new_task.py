@@ -15,7 +15,7 @@ from pytext.models.model import BaseModel
 from pytext.trainers import TaskTrainer, TrainingState
 from pytext.utils import cuda, onnx
 from pytext.utils.usage import log_class_usage
-from torch import jit
+from torch import jit, sort
 
 from .task import TaskBase
 
@@ -49,7 +49,7 @@ def create_schema(
 
 
 def create_tensorizers(
-    model_inputs: Union[BaseModel.Config.ModelInput, Dict[str, Tensorizer.Config]],
+    model_inputs: Union[BaseModel.Config.ModelInput, Dict[str, Tensorizer.Config]]
 ) -> Dict[str, Tensorizer]:
     if not isinstance(model_inputs, dict):
         model_inputs = model_inputs._asdict()
@@ -259,12 +259,7 @@ class _NewTask(TaskBase):
     def export(self, model, export_path, metric_channels=None, export_onnx_path=None):
         # Make sure to put the model on CPU and disable CUDA before exporting to
         # ONNX to disable any data_parallel pieces
-        if model.__class__.__name__ not in onnx.ONNX_MODEL_WHITELIST:
-            raise Exception(
-                "Please use torchscript_export to export a TorchScript model. "
-                "If there is hard blocker, contact latte_nlp oncall and add your "
-                "model to whitelist in pytext/utils/onnx.py."
-            )
+        onnx.validate_onnx_export(model)
 
         cuda.CUDA_ENABLED = False
         model = model.cpu()
@@ -283,7 +278,9 @@ class _NewTask(TaskBase):
             self.data.tensorizers, batch, export_path, export_onnx_path=export_onnx_path
         )
 
-    def torchscript_export(self, model, export_path=None, quantize=False):
+    def torchscript_export(
+        self, model, export_path=None, quantize=False, sort_input=False, sort_key=1
+    ):
         # Make sure to put the model on CPU and disable CUDA before exporting to
         # ONNX to disable any data_parallel pieces
         cuda.CUDA_ENABLED = False
@@ -298,8 +295,11 @@ class _NewTask(TaskBase):
         unused_raw_batch, batch = next(
             iter(self.data.batches(Stage.TRAIN, load_early=True))
         )
-        inputs = model.arrange_model_inputs(batch)
+        inputs = model.onnx_trace_input(batch)
         # call model forward to set correct device types
+        if sort_input:
+            _, sorted_indices = sort(inputs[sort_key], descending=True)
+            inputs = [i.index_select(0, sorted_indices) for i in inputs]
         model(*inputs)
         if quantize:
             model.quantize()

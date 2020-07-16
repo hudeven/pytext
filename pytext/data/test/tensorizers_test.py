@@ -7,6 +7,7 @@ from typing import List
 import numpy as np
 import pandas as pd
 import torch
+from pytext.common.constants import SpecialTokens
 from pytext.data.bert_tensorizer import BERTTensorizer, BERTTensorizerScriptImpl
 from pytext.data.roberta_tensorizer import (
     RoBERTaTensorizer,
@@ -25,6 +26,7 @@ from pytext.data.tensorizers import (
     AnnotationNumberizer,
     ByteTensorizer,
     ByteTokenTensorizer,
+    FloatListSeqTensorizer,
     FloatListTensorizer,
     GazetteerTensorizer,
     LabelListTensorizer,
@@ -43,7 +45,7 @@ from pytext.data.tokenizers import (
     Tokenizer,
     WordPieceTokenizer,
 )
-from pytext.data.utils import BOS, EOS, Vocabulary
+from pytext.data.utils import Vocabulary
 from pytext.utils import precision
 from pytext.utils.test import import_tests_module
 
@@ -55,7 +57,7 @@ class LookupTokensTest(unittest.TestCase):
     def test_lookup_tokens(self):
         text = "let's tokenize this"
         tokenizer = Tokenizer()
-        vocab = Vocabulary(text.split() + [BOS, EOS])
+        vocab = Vocabulary(text.split() + [SpecialTokens.BOS, SpecialTokens.EOS])
         tokens, start_idx, end_idx = lookup_tokens(
             text, tokenizer=tokenizer, vocab=vocab, bos_token=None, eos_token=None
         )
@@ -64,7 +66,11 @@ class LookupTokensTest(unittest.TestCase):
         self.assertEqual(end_idx, (5, 14, 19))
 
         tokens, start_idx, end_idx = lookup_tokens(
-            text, tokenizer=tokenizer, vocab=vocab, bos_token=BOS, eos_token=EOS
+            text,
+            tokenizer=tokenizer,
+            vocab=vocab,
+            bos_token=SpecialTokens.BOS,
+            eos_token=SpecialTokens.EOS,
         )
         self.assertEqual(tokens, [3, 0, 1, 2, 4])
         self.assertEqual(start_idx, (-1, 0, 6, 15, -1))
@@ -571,7 +577,13 @@ class TensorizersTest(unittest.TestCase):
             self.assertEqual(
                 [
                     ["where", "do", "you", "wanna", "meet?"],
-                    ["mpk", "__PAD__", "__PAD__", "__PAD__", "__PAD__"],
+                    [
+                        "mpk",
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                    ],
                 ],
                 tokens,
             )
@@ -678,40 +690,40 @@ class TensorizersTest(unittest.TestCase):
             self.assertEqual(
                 [
                     [
-                        "__BEGIN_OF_SENTENCE__",
-                        "__BEGIN_OF_LIST__",
-                        "__END_OF_SENTENCE__",
-                        "__PAD__",
-                        "__PAD__",
-                        "__PAD__",
-                        "__PAD__",
+                        str(SpecialTokens.BOS),
+                        str(SpecialTokens.BOL),
+                        str(SpecialTokens.EOS),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
                     ],
                     [
-                        "__BEGIN_OF_SENTENCE__",
+                        str(SpecialTokens.BOS),
                         "where",
                         "do",
                         "you",
                         "wanna",
                         "meet?",
-                        "__END_OF_SENTENCE__",
+                        str(SpecialTokens.EOS),
                     ],
                     [
-                        "__BEGIN_OF_SENTENCE__",
+                        str(SpecialTokens.BOS),
                         "mpk",
-                        "__END_OF_SENTENCE__",
-                        "__PAD__",
-                        "__PAD__",
-                        "__PAD__",
-                        "__PAD__",
+                        str(SpecialTokens.EOS),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
                     ],
                     [
-                        "__BEGIN_OF_SENTENCE__",
-                        "__END_OF_LIST__",
-                        "__END_OF_SENTENCE__",
-                        "__PAD__",
-                        "__PAD__",
-                        "__PAD__",
-                        "__PAD__",
+                        str(SpecialTokens.BOS),
+                        str(SpecialTokens.EOL),
+                        str(SpecialTokens.EOS),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
+                        str(SpecialTokens.PAD),
                     ],
                 ],
                 tokens,
@@ -860,6 +872,52 @@ class TensorizersTest(unittest.TestCase):
             ),
             round_list(output),
         )
+
+    def test_create_float_list_seq_tensor(self):
+        tensorizer = FloatListSeqTensorizer(column="dense", dim=2, error_check=True)
+        tests = [
+            (
+                ["[0.1,0.2]", "[0.1, 0.2]", "[0.1,  0.2]", "[0.1 0.2]"],
+                [[0.1, 0.2], [0.1, 0.2], [0.1, 0.2], [0.1, 0.2]],
+                4,
+            ),
+            (
+                ["[0.1  0.2]", "[ 0.1  0.2]", "[0.1  0.2 ]", "[ 0.1 0.2 ]", "[0.  1.]"],
+                [[0.1, 0.2], [0.1, 0.2], [0.1, 0.2], [0.1, 0.2], [0.0, 1.0]],
+                5,
+            ),
+        ]
+        for raw_list, expected, expected_length in tests:
+            row = {"dense": [load_float_list(raw) for raw in raw_list]}
+            numberized, numberized_len = tensorizer.numberize(row)
+            self.assertEqual(expected, numberized)
+            self.assertEqual(expected_length, numberized_len)
+
+        batch = []
+        for raw_list, _, _ in tests:
+            row = {"dense": [load_float_list(raw) for raw in raw_list]}
+            tensor, tensor_len = tensorizer.numberize(row)
+            batch.append((tensor, tensor_len))
+
+        tensor, tensor_lens = tensorizer.tensorize(batch)
+        self.assertEqual(list(tensor.size()), [2, 5, 2])
+        self.assertEqual(tensor.dtype, torch.float)
+        self.assertEqual(tensor_lens.tolist(), [4, 5])
+
+    def test_float_list_seq_tensor_prepare_input(self):
+        tensorizer = FloatListSeqTensorizer(column="dense", dim=2, error_check=True)
+        tests = [
+            (
+                ["[0.1,0.2]", "[0.1, 0.2]", "[0.1,  0.2]", "[0.1 0.2]"],
+                [[0.1, 0.2], [0.1, 0.2], [0.1, 0.2], [0.1, 0.2]],
+                4,
+            )
+        ]
+        for raw_list, expected, expect_length in tests:
+            row = {"dense": [load_float_list(raw) for raw in raw_list]}
+            numberized, numberized_len = tensorizer.prepare_input(row)
+            self.assertEqual(expected, numberized)
+            self.assertEqual(expect_length, numberized_len)
 
     def test_annotation_num(self):
         data = TSVDataSource(
@@ -1075,8 +1133,8 @@ class SquadForRobertaTensorizerTest(unittest.TestCase):
         tokens, segments, seq_len, positions, start, end = tensorizer.numberize(row)
         # check against manually verified answer positions in tokenized output
         # there are 4 identical answers
-        self.assertEqual(start, [5])
-        self.assertEqual(end, [5])
+        self.assertEqual(start, [3])
+        self.assertEqual(end, [3])
         self.assertEqual(len(tokens), seq_len)
         self.assertEqual(len(segments), seq_len)
 

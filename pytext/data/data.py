@@ -93,7 +93,7 @@ class PoolingBatcher(Batcher):
 
     class Config(Batcher.Config):
         #: Size of a pool expressed in number of batches
-        pool_num_batches: int = 10000
+        pool_num_batches: int = 1000
         #: How many pool-sized chunks to load at a time for shuffling
         num_shuffled_pools: int = 1
 
@@ -266,7 +266,7 @@ class Data(Component):
         tensorizers: Dict[str, Tensorizer],
         batcher: Batcher = None,
         sort_key: Optional[str] = None,
-        in_memory: Optional[bool] = False,
+        in_memory: Optional[bool] = True,
         init_tensorizers: Optional[bool] = True,
         init_tensorizers_from_scratch: Optional[bool] = True,
     ):
@@ -335,7 +335,7 @@ class Data(Component):
         Passing in `load_early` = True disables loading all data in memory and using
         PoolingBatcher, so that we get the first batch as quickly as possible.
         """
-        data_source = data_source or self.data_source
+        data_source = data_source if data_source is not None else self.data_source
         rows = {
             Stage.TRAIN: data_source.train,
             Stage.TEST: data_source.test,

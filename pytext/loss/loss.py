@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+from enum import Enum
+
 import torch
 import torch.nn.functional as F
 from pytext.config import ConfigBase
@@ -8,6 +10,12 @@ from pytext.config.component import Component, ComponentType
 from pytext.utils import loss as loss_utils, precision
 from pytext.utils.cuda import FloatTensor
 from torch import nn
+
+
+class SourceType(Enum):
+    LOG_PROBS = "log_probs"
+    LOGITS = "logits"
+    PROBS = "probs"
 
 
 class Loss(Component):
@@ -495,7 +503,7 @@ class MSELoss(Loss):
 class LabelSmoothedCrossEntropyLoss(Loss):
     class Config(ConfigBase):
         beta: float = 0.1
-        from_logits: bool = True
+        source: SourceType = SourceType.LOGITS
         use_entropy: bool = False
 
     def __init__(self, config, ignore_index=-100, weight=None, *args, **kwargs):
@@ -507,8 +515,10 @@ class LabelSmoothedCrossEntropyLoss(Loss):
         self.ignore_index = ignore_index
         self.weight = weight
         self.beta = config.beta
-        self.from_logits = config.from_logits
+        self.source = config.source
         self.use_entropy = config.use_entropy
+        self.cross_entropy_loss = None
+        self.label_smoothing_loss = None
 
     def __call__(self, logits, targets, reduce=True):
         """
@@ -527,7 +537,12 @@ class LabelSmoothedCrossEntropyLoss(Loss):
         else:
             # negative KL-div has an additional log(num_classes) term but ignored
             # here because it doesn't contribute to optimization
-            log_probs = F.log_softmax(logits, dim=1) if self.from_logits else logits
+            if self.source == SourceType.LOGITS:
+                log_probs = F.log_softmax(logits, dim=1)
+            elif self.source == SourceType.PROBS:
+                log_probs = logits.log()
+            else:
+                log_probs = logits
             label_smoothing_loss = -1 * log_probs.mean(dim=1)
 
         if reduce:
@@ -545,6 +560,9 @@ class LabelSmoothedCrossEntropyLoss(Loss):
             weight=self.weight,
         )
 
+        self.cross_entropy_loss = cross_entropy_loss
+        self.label_smoothing_loss = label_smoothing_loss
+
         return (1.0 - self.beta) * cross_entropy_loss + self.beta * label_smoothing_loss
 
 
@@ -552,6 +570,7 @@ class LabelSmoothedCrossEntropyLengthLoss(Loss):
     class Config(LabelSmoothedCrossEntropyLoss.Config):
         lengths_weight: float = 0.25
         beta_2: float = 0.25
+        assert_valid_targets: bool = True
 
     def __init__(self, config, weight=None, ignore_index=-100):
         # weight values other than 1.0 gives inconsistent behavior
@@ -560,13 +579,16 @@ class LabelSmoothedCrossEntropyLengthLoss(Loss):
             assert torch.sum(torch.abs(weight - 1.0)) < 1e-7
 
         self.lengths_weight = config.lengths_weight
+        self.assert_valid_targets = config.assert_valid_targets
         self.label_smoothing_loss = LabelSmoothedCrossEntropyLoss(
             config, ignore_index=ignore_index, weight=weight
         )
 
         self.length_loss = LabelSmoothedCrossEntropyLoss(
             config=LabelSmoothedCrossEntropyLoss.Config(
-                beta=config.beta_2, use_entropy=config.use_entropy, from_logits=False
+                beta=config.beta_2,
+                use_entropy=config.use_entropy,
+                source=SourceType.LOG_PROBS,
             )
         )
 
@@ -576,9 +598,12 @@ class LabelSmoothedCrossEntropyLengthLoss(Loss):
         max_supported_dim = length_log_probs.size(1)
         length_targets = length_targets.unsqueeze(-1)
 
-        assert not torch.any(
-            length_targets >= max_supported_dim
-        ), f"max_supported_dim: {max_supported_dim}, Total Violations : {str(length_targets[length_targets >= max_supported_dim].flatten().tolist())}"
+        if self.assert_valid_targets:
+            assert not torch.any(
+                length_targets >= max_supported_dim
+            ), f"max_supported_dim: {max_supported_dim}, Total Violations : {str(length_targets[length_targets >= max_supported_dim].flatten().tolist())}"
+        else:
+            length_targets[length_targets >= max_supported_dim] = max_supported_dim - 1
 
         length_loss = self.length_loss(
             logits=length_log_probs, targets=length_targets.view(-1), reduce=reduce
@@ -586,4 +611,14 @@ class LabelSmoothedCrossEntropyLengthLoss(Loss):
 
         total_loss = label_loss + self.lengths_weight * length_loss
 
-        return total_loss, {"label_loss": label_loss, "length_loss": length_loss}
+        return (
+            total_loss,
+            {
+                "label_loss": label_loss,
+                "length_loss": length_loss,
+                "labels_cross_entropy_loss": self.label_smoothing_loss.cross_entropy_loss,
+                "labels_label_smoothing_loss": self.label_smoothing_loss.label_smoothing_loss,
+                "lengths_cross_entropy_loss": self.length_loss.cross_entropy_loss,
+                "lengths_label_smoothing_loss": self.length_loss.label_smoothing_loss,
+            },
+        )

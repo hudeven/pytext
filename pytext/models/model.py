@@ -132,7 +132,7 @@ class BaseModel(nn.Module, Component):
         # By default we dynamic quantize Linear for PyText models.
         # Todo: we can also add quantized torch.nn.LSTM/GRU support in the future.
         torch.quantization.quantize_dynamic(
-            self, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
+            self, {torch.nn.Linear, torch.nn.LSTM}, dtype=torch.qint8, inplace=True
         )
 
     def get_param_groups_for_optimizer(self) -> List[Dict[str, List[nn.Parameter]]]:
@@ -210,6 +210,10 @@ class BaseModel(nn.Module, Component):
     def arrange_model_context(self, tensor_dict):
         # should raise NotImplementedError after migration is done
         return None
+
+    def onnx_trace_input(self, tensor_dict):
+        # default behavior is the same as getting model inputs
+        return self.arrange_model_inputs(tensor_dict)
 
     def caffe2_export(self, tensorizers, tensor_dict, path, export_onnx_path=None):
         pass
@@ -424,7 +428,7 @@ class Model(BaseModel):
             input_representation = input_representation[:-1]
         decoder_inputs: tuple = ()
         if self.decoder.num_decoder_modules:
-            decoder_inputs = inputs[-self.decoder.num_decoder_modules :]
+            decoder_inputs = inputs[-(self.decoder.num_decoder_modules) :]
         return self.decoder(
             *input_representation, *decoder_inputs
         )  # returned Tensor's dim = (batch_size, num_classes)

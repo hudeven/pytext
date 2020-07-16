@@ -5,7 +5,9 @@ import sys
 import traceback
 from typing import Tuple
 
+import numpy as np
 import torch
+from numpy import linalg as LA
 from pytext.common.constants import Stage
 from pytext.utils.file_io import PathManager
 from torch.utils.tensorboard import SummaryWriter
@@ -202,6 +204,8 @@ class TensorBoardChannel(Channel):
         meta,
         model,
         optimizer,
+        log_gradient,
+        gradients,
         *args,
     ):
         """
@@ -266,33 +270,32 @@ class TensorBoardChannel(Channel):
                     self.summary_writer.add_scalar(
                         f"optimizer.lr.param_group.{idx}", param_group["lr"], epoch
                     )
+            if log_gradient and gradients:
+                for key in gradients:
+                    if len(gradients[key]):
+                        sum_gradient = sum(gradients[key])
+                        avg_gradient = sum_gradient / len(gradients[key])
+                        grad_norms = np.array([LA.norm(g) for g in gradients[key]])
+                        self.log_vector(key + "_avg_gradients", avg_gradient, epoch)
+                        self.log_vector(key + "_sum_gradients", sum_gradient, epoch)
+                        self.log_vector(key + "_l2norm_gradients", grad_norms, epoch)
+
             for key, val in model.named_parameters():
                 if val is not None and len(val) > 0 and not (val == 0).all():
                     limit = 9.9e19
-                    grad = val.grad
                     val = torch.clamp(val.float(), -limit, limit)
-                    try:
-                        self.summary_writer.add_histogram(key, val, epoch)
-                    except Exception:
-                        print(
-                            f"WARNING: Param {key} cannot be sent to Tensorboard",
-                            file=sys.stderr,
-                        )
-                        traceback.print_exc(file=sys.stderr)
+                    self.log_vector(key, val, epoch)
 
-                    if grad is not None and len(grad) > 0 and not (grad == 0).all():
-                        grad = torch.clamp(grad.float(), -limit, limit)
-                        try:
-                            self.summary_writer.add_histogram(
-                                key + "_gradients", grad, epoch
-                            )
-                        except Exception:
-                            print(
-                                f"WARNING: Grad for param {key} "
-                                "cannot be sent to Tensorboard",
-                                file=sys.stderr,
-                            )
-                            traceback.print_exc(file=sys.stderr)
+    def log_vector(self, key, val, epoch):
+        if len(val) > 0 and not (val == 0).all():
+            try:
+                self.summary_writer.add_histogram(key, val, epoch)
+            except Exception:
+                print(
+                    f"WARNING: Param {key} " "cannot be sent to Tensorboard",
+                    file=sys.stderr,
+                )
+                traceback.print_exc(file=sys.stderr)
 
     def add_texts(self, tag, metrics):
         """
@@ -325,12 +328,14 @@ class TensorBoardChannel(Channel):
                 metrics object will be prepended with the prefix.
             metrics (Any): The metrics object.
         """
-        for field_name, field_value in metrics._asdict().items():
+        if hasattr(metrics, "_asdict"):
+            metrics = metrics._asdict()
+        for field_name, field_value in metrics.items():
             if isinstance(field_value, (int, float)):
                 self.summary_writer.add_scalar(
                     f"{prefix}/{field_name}", field_value, epoch
                 )
-            elif hasattr(field_value, "_asdict"):
+            elif hasattr(field_value, "_asdict") or isinstance(field_value, dict):
                 self.add_scalars(f"{prefix}/{field_name}", field_value, epoch)
 
     def close(self):
